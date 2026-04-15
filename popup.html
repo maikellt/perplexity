@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YouTube → Perplexity Summarizer</title>
+  <style>
+    /* ── Reset & Base ─────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:            #0f0f0f;
+      --surface:       #1a1a1a;
+      --surface-2:     #242424;
+      --border:        rgba(255,255,255,0.08);
+      --text:          #e8e8e8;
+      --text-muted:    #888;
+      --text-faint:    #555;
+      --accent:        #4f98a3;   /* teal do Perplexity */
+      --accent-hover:  #3d7f8a;
+      --yt-red:        #ff0000;
+      --success:       #5fa85f;
+      --error:         #c0504d;
+      --radius:        10px;
+      --transition:    180ms cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    body {
+      width: 320px;
+      min-height: 160px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      user-select: none;
+    }
+
+    /* ── Header ───────────────────────────────────────────── */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      background: var(--surface-2);
+      border-radius: 8px;
+      flex-shrink: 0;
+    }
+
+    .logo svg { display: block; }
+
+    .header-text { flex: 1; min-width: 0; }
+    .header-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .header-sub {
+      font-size: 11px;
+      color: var(--text-faint);
+      margin-top: 1px;
+    }
+
+    /* ── Main content ─────────────────────────────────────── */
+    .content { padding: 14px 16px; }
+
+    /* ── Status card ──────────────────────────────────────── */
+    .status-card {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin-bottom: 12px;
+    }
+
+    .status-icon {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      flex-shrink: 0;
+      margin-top: 1px;
+    }
+
+    .status-icon.neutral { background: rgba(255,255,255,0.06); }
+    .status-icon.active  { background: rgba(79,152,163,0.15); }
+    .status-icon.warning { background: rgba(255,0,0,0.10); }
+
+    .status-body { flex: 1; min-width: 0; }
+    .status-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 3px;
+    }
+    .status-desc {
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.4;
+    }
+
+    /* ── Video title chip ─────────────────────────────────── */
+    .video-title {
+      font-size: 11px;
+      color: var(--text-muted);
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      margin-bottom: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .video-title span {
+      color: var(--text-faint);
+      margin-right: 4px;
+    }
+
+    /* ── Botão principal ──────────────────────────────────── */
+    .btn-summarize {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      width: 100%;
+      padding: 9px 14px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      border: none;
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition:
+        background var(--transition),
+        transform var(--transition),
+        opacity var(--transition);
+    }
+    .btn-summarize:hover:not(:disabled)  { background: var(--accent-hover); }
+    .btn-summarize:active:not(:disabled) { transform: scale(0.98); }
+    .btn-summarize:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .btn-summarize svg { flex-shrink: 0; }
+
+    /* ── Toast de feedback ────────────────────────────────── */
+    .toast {
+      display: none;
+      align-items: center;
+      gap: 7px;
+      padding: 8px 10px;
+      border-radius: 7px;
+      font-size: 11px;
+      font-weight: 500;
+      margin-top: 10px;
+    }
+    .toast.show  { display: flex; }
+    .toast.ok    { background: rgba(95,168,95,0.15);  color: var(--success); }
+    .toast.error { background: rgba(192,80,77,0.15);  color: var(--error);   }
+
+    /* ── Footer ───────────────────────────────────────────── */
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 16px 10px;
+      border-top: 1px solid var(--border);
+    }
+    .footer-version { font-size: 10px; color: var(--text-faint); }
+    .footer-link {
+      font-size: 10px;
+      color: var(--text-faint);
+      text-decoration: none;
+      transition: color var(--transition);
+    }
+    .footer-link:hover { color: var(--accent); }
+
+    /* ── Skeleton / loading pulse ─────────────────────────── */
+    .pulse {
+      animation: pulse 1.8s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
+    }
+
+    /* ── Hidden helper ────────────────────────────────────── */
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="logo">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <!-- Ícone: triângulo play (YouTube) + seta (Perplexity) -->
+        <path d="M5 3L19 12L5 21V3Z" fill="#ff0000" opacity="0.9"/>
+        <path d="M14 17l4-5-4-5" stroke="#4f98a3" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </div>
+    <div class="header-text">
+      <div class="header-title">YT → Perplexity</div>
+      <div class="header-sub">Resumir vídeos com IA</div>
+    </div>
+  </header>
+
+  <!-- Conteúdo principal -->
+  <main class="content">
+
+    <!-- Estado: não está no YouTube -->
+    <div id="state-no-yt" class="hidden">
+      <div class="status-card">
+        <div class="status-icon warning">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <circle cx="12" cy="12" r="10" stroke="#ff4444" stroke-width="2"/>
+            <path d="M12 8v4M12 16h.01" stroke="#ff4444" stroke-width="2"
+                  stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div class="status-body">
+          <div class="status-label">Fora do YouTube</div>
+          <div class="status-desc">Abra um vídeo no YouTube e clique em<br>
+            <strong>"▶ Resumir no Perplexity"</strong> abaixo do player.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Estado: no YouTube mas sem vídeo específico -->
+    <div id="state-no-video" class="hidden">
+      <div class="status-card">
+        <div class="status-icon warning">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"
+                  stroke="#ff9900" stroke-width="2" stroke-linecap="round"
+                  stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="status-body">
+          <div class="status-label">Nenhum vídeo ativo</div>
+          <div class="status-desc">Navegue até um vídeo específico no YouTube para usar a extensão.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Estado: pronto para resumir -->
+    <div id="state-ready" class="hidden">
+      <div class="status-card">
+        <div class="status-icon active">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M20 6L9 17l-5-5" stroke="#4f98a3" stroke-width="2.5"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <div class="status-body">
+          <div class="status-label">Vídeo detectado</div>
+          <div class="status-desc">Pronto para extrair transcrição e resumir.</div>
+        </div>
+      </div>
+
+      <div id="video-title-chip" class="video-title hidden">
+        <span>▶</span><span id="video-title-text"></span>
+      </div>
+
+      <button id="btn-summarize" class="btn-summarize" type="button"
+              aria-label="Resumir este vídeo no Perplexity">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="11" cy="11" r="8" stroke="currentColor" stroke-width="2"/>
+          <path d="M21 21l-4.35-4.35M11 8v6M8 11h6"
+                stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        <span id="btn-label">Resumir no Perplexity</span>
+      </button>
+
+      <!-- Feedback inline -->
+      <div id="toast" class="toast" role="status" aria-live="polite">
+        <span id="toast-text"></span>
+      </div>
+    </div>
+
+    <!-- Estado: carregando (detectando aba) -->
+    <div id="state-loading" class="status-card pulse">
+      <div class="status-icon neutral">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83
+                   M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"
+                stroke="#888" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div class="status-body">
+        <div class="status-label">Verificando aba...</div>
+        <div class="status-desc">Aguarde um instante.</div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <span class="footer-version">v1.0.0</span>
+    <a class="footer-link"
+       href="https://perplexity.ai"
+       target="_blank"
+       rel="noopener noreferrer">
+      perplexity.ai ↗
+    </a>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
