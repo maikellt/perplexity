@@ -1,16 +1,23 @@
-// content.js — YouTube → Perplexity Summarizer (v1.2)
-// Correções:
-//   - Tratamento de resposta vazia / não-JSON na fetchTranscript
-//   - Fallback XML quando fmt=json3 falha (comum em faixas ASR)
-//   - fetchPlayerResponse mais robusto com regex tolerante
-//   - Parâmetro &hl=pt-BR adicionado nas requisições de transcrição
+// content.js — YouTube → Perplexity Summarizer (v1.3)
+// Estratégia: usa Innertube API (POST) para obter captionTracks frescos,
+// evitando baseUrl com &exp=xpe (PoToken) que causa resposta vazia.
 
 (function () {
   'use strict';
 
-  const BUTTON_ID = 'yt-perplexity-btn';
-  const MAX_CHARS = 8000;
+  const BUTTON_ID   = 'yt-perplexity-btn';
+  const MAX_CHARS   = 8000;
   const LANG_PRIORITY = ['pt-BR', 'pt', 'pt-PT', 'en', 'en-US', 'en-GB'];
+
+  // Contexto padrão do cliente web do YouTube (Innertube)
+  const INNERTUBE_CONTEXT = {
+    client: {
+      clientName: 'WEB',
+      clientVersion: '2.20240101.00.00',
+      hl: 'pt-BR',
+      gl: 'BR',
+    },
+  };
 
   // ─────────────────────────────────────────────────────────────
   // Utilitários
@@ -34,48 +41,53 @@
   }
 
   // ─────────────────────────────────────────────────────────────
-  // Obtenção do ytInitialPlayerResponse
-  // Primeiro tenta o objeto em memória; se desatualizado ou sem
-  // captions, faz fetch fresh do HTML da página.
+  // Extrai INNERTUBE_API_KEY do HTML da página
   // ─────────────────────────────────────────────────────────────
 
-  async function fetchPlayerResponse(videoId) {
-    // 1ª tentativa: objeto em memória (válido apenas no carregamento direto)
-    const cached = window.ytInitialPlayerResponse;
-    if (cached?.videoDetails?.videoId === videoId &&
-        cached?.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length) {
-      return cached;
-    }
-
-    // 2ª tentativa: fetch fresh do HTML — garante URLs assinadas e válidas
+  async function fetchInnertubeKey(videoId) {
     const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
       credentials: 'include',
       headers: { 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' },
     });
-    if (!res.ok) throw new Error(`Falha ao buscar página: HTTP ${res.status}`);
-
+    if (!res.ok) throw new Error(`Falha na página: HTTP ${res.status}`);
     const html = await res.text();
-    if (!html) throw new Error('Resposta da página veio vazia');
 
-    const marker = 'ytInitialPlayerResponse = ';
-    const start  = html.indexOf(marker);
-    if (start === -1) throw new Error('Dados do vídeo não encontrados na página');
-
-    // Extrai o JSON de forma tolerante (corta no próximo ;var / ;const ou </script>)
-    const raw = html.slice(start + marker.length);
-    const jsonStr = raw.split(/;(?:var|const|let)\s|\n<\/script>/)[0].trim();
-
-    if (!jsonStr || jsonStr[0] !== '{') {
-      throw new Error('Formato de resposta inesperado — tente recarregar a página');
-    }
-
-    return JSON.parse(jsonStr);
+    const m = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
+    if (!m) throw new Error('INNERTUBE_API_KEY não encontrada na página');
+    return m[1];
   }
 
   // ─────────────────────────────────────────────────────────────
-  // Seleção da melhor faixa de legenda
-  // vssId ".pt-BR"   = manual
-  // vssId ".a.pt-BR" = ASR (gerada automaticamente)
+  // Chama a Innertube API para obter captionTracks frescos
+  // (sem &exp=xpe, sem expiração problemática)
+  // ─────────────────────────────────────────────────────────────
+
+  async function fetchCaptionTracksViaInnertube(videoId, apiKey) {
+    const url = `https://www.youtube.com/youtubei/v1/player?key=${apiKey}&prettyPrint=false`;
+    const res = await fetch(url, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+      },
+      body: JSON.stringify({
+        context: INNERTUBE_CONTEXT,
+        videoId,
+      }),
+    });
+
+    if (!res.ok) throw new Error(`Innertube API: HTTP ${res.status}`);
+    const data = await res.json();
+
+    const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+    if (!tracks?.length) throw new Error('Nenhuma legenda disponível neste vídeo');
+
+    return tracks;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Seleção da melhor faixa
   // ─────────────────────────────────────────────────────────────
 
   function pickBestTrack(tracks) {
@@ -86,90 +98,88 @@
     }
     // 2. ASR no idioma preferido
     for (const lang of LANG_PRIORITY) {
+      const code = lang.split('-')[0];
       const t = tracks.find(
-        t => t.vssId === '.a.' + lang || (t.kind === 'asr' && t.languageCode === lang)
+        t => (t.kind === 'asr' || t.vssId?.startsWith('.a.')) &&
+             (t.languageCode === lang || t.languageCode === code)
       );
       if (t) return { track: t, tlang: null };
     }
-    // 3. Qualquer manual + solicita tradução automática
-    const manual = tracks.find(t => t.vssId?.startsWith('.') && !t.vssId?.startsWith('.a.'));
+    // 3. Qualquer manual + tradução automática para pt-BR
+    const manual = tracks.find(t => t.kind !== 'asr' && !t.vssId?.startsWith('.a.'));
     if (manual) return { track: manual, tlang: 'pt-BR' };
 
     // 4. Qualquer faixa disponível
-    if (tracks[0]) return { track: tracks[0], tlang: 'pt-BR' };
-
-    return null;
+    return { track: tracks[0], tlang: 'pt-BR' };
   }
 
   // ─────────────────────────────────────────────────────────────
-  // Busca da transcrição — tenta JSON3, cai em XML se falhar
+  // Busca da transcrição — XML (mais confiável que JSON3 para ASR)
   // ─────────────────────────────────────────────────────────────
 
-  async function fetchTranscriptJSON3(url) {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  function buildTranscriptUrl(track, tlang) {
+    // Remove fmt existente e parâmetros problemáticos
+    let url = track.baseUrl
+      .replace(/[&?]fmt=[^&]*/g, '')
+      .replace(/[&?]exp=xpe[^&]*/g, '');
 
-    const text = await res.text();
-    if (!text || text.trim() === '') throw new Error('Resposta vazia');
-    if (text.trim()[0] !== '{') throw new Error('Resposta não é JSON: ' + text.slice(0, 80));
+    // Garante o separador correto
+    url += (url.includes('?') ? '&' : '?') + 'hl=pt-BR';
+    if (tlang) url += `&tlang=${tlang}`;
 
-    const data = JSON.parse(text);
-    const result = (data.events ?? [])
-      .filter(e => Array.isArray(e.segs))
-      .map(e => e.segs.map(s => s.utf8 ?? '').join(''))
-      .join(' ')
-      .replace(/[\r\n]+/g, ' ')
-      .replace(/\s{2,}/g, ' ')
-      .trim();
-
-    if (!result) throw new Error('JSON3 retornou eventos sem texto');
-    return result;
+    return url;
   }
 
-  async function fetchTranscriptXML(url) {
-    // Fallback: formato XML (padrão quando fmt não é especificado)
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  function parseXML(xmlText) {
+    const matches = [...xmlText.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)];
+    if (!matches.length) throw new Error('Nenhum segmento no XML da transcrição');
 
-    const xml = await res.text();
-    if (!xml || xml.trim() === '') throw new Error('XML vazio');
-
-    // Extrai o texto de cada <text>...</text>, removendo tags HTML internas
-    const matches = [...xml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)];
-    if (!matches.length) throw new Error('Nenhum segmento de texto encontrado no XML');
-
-    const result = matches
+    return matches
       .map(m => m[1]
-        .replace(/<[^>]+>/g, '')          // remove tags HTML internas
+        .replace(/<[^>]+>/g, '')
         .replace(/&amp;/g,  '&')
         .replace(/&lt;/g,   '<')
         .replace(/&gt;/g,   '>')
         .replace(/&#39;/g,  "'")
         .replace(/&quot;/g, '"')
+        .trim()
       )
+      .filter(Boolean)
       .join(' ')
       .replace(/\s{2,}/g, ' ')
       .trim();
-
-    if (!result) throw new Error('XML retornou apenas tags vazias');
-    return result;
   }
 
   async function fetchTranscript(track, tlang) {
-    // Monta parâmetros base — &hl=pt-BR ajuda a obter ASR traduzido
-    const baseUrl = track.baseUrl
-      + '&hl=pt-BR'
-      + (tlang ? `&tlang=${tlang}` : '');
+    const url = buildTranscriptUrl(track, tlang);
 
-    // Tenta JSON3 primeiro (mais estruturado)
-    try {
-      return await fetchTranscriptJSON3(baseUrl + '&fmt=json3');
-    } catch (errJson) {
-      console.warn('[YT→Perplexity] JSON3 falhou, tentando XML:', errJson.message);
+    const res = await fetch(url, { credentials: 'include' });
+    if (!res.ok) throw new Error(`Transcrição: HTTP ${res.status}`);
+
+    const text = await res.text();
+    if (!text?.trim()) throw new Error('Resposta da transcrição vazia');
+
+    // Tenta XML (padrão e mais confiável)
+    if (text.trim().startsWith('<')) {
+      const result = parseXML(text);
+      if (result) return result;
+      throw new Error('XML sem segmentos válidos');
     }
 
-    // Fallback: XML nativo do YouTube
-    return await fetchTranscriptXML(baseUrl);
+    // Tenta JSON3 como fallback
+    if (text.trim().startsWith('{')) {
+      const data = JSON.parse(text);
+      const result = (data.events ?? [])
+        .filter(e => Array.isArray(e.segs))
+        .map(e => e.segs.map(s => s.utf8 ?? '').join(''))
+        .join(' ')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+      if (result) return result;
+      throw new Error('JSON3 sem texto válido');
+    }
+
+    throw new Error('Formato de transcrição não reconhecido');
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -184,58 +194,48 @@
       truncated = true;
     }
 
-    const lines = [
+    const notes = [];
+    if (isAsr) notes.push('transcrição gerada automaticamente — pode conter imprecisões');
+    if (truncated) notes.push('transcrição truncada por limite de caracteres');
+
+    return [
       'Resuma o vídeo do YouTube abaixo com base na transcrição fornecida.',
       '',
       `Título: ${title}`,
       `URL: ${videoUrl}`,
-    ];
-
-    if (isAsr) {
-      lines.push('Nota: transcrição gerada automaticamente pelo YouTube — pode conter imprecisões.');
-    }
-    if (truncated) {
-      lines.push('Nota: transcrição truncada por limite de caracteres.');
-    }
-
-    lines.push(
+      ...(notes.length ? [`Notas: ${notes.join('; ')}`] : []),
       '',
       'Instruções:',
-      '- Apresente os principais pontos abordados',
-      '- Use tópicos quando houver múltiplos assuntos distintos',
+      '- Apresente os principais pontos em tópicos',
       '- Seja objetivo e claro',
       '- Responda em português do Brasil',
       '',
       'Transcrição:',
-      body
-    );
-
-    return lines.join('\n');
+      body,
+    ].join('\n');
   }
 
   // ─────────────────────────────────────────────────────────────
   // Estados do botão
   // ─────────────────────────────────────────────────────────────
 
-  const BTN_STATES = {
-    idle:    { label: '▶ Resumir no Perplexity', disabled: false },
-    loading: { label: '⏳ Extraindo transcrição...', disabled: true },
-    error:   { label: '⚠ Sem transcrição disponível', disabled: true },
-    success: { label: '✓ Aberto no Perplexity', disabled: true },
-  };
-
-  function applyState(btn, state) {
-    const s = BTN_STATES[state];
-    btn.querySelector('.yt-pp-label').textContent = s.label;
-    btn.disabled = s.disabled;
+  function applyState(btn, state, errorMsg) {
+    const labels = {
+      idle:    '▶ Resumir no Perplexity',
+      loading: '⏳ Obtendo transcrição...',
+      error:   errorMsg || '⚠ Sem transcrição disponível',
+      success: '✓ Aberto no Perplexity',
+    };
+    btn.querySelector('.yt-pp-label').textContent = labels[state];
+    btn.disabled = state !== 'idle';
     btn.dataset.state = state;
     if (state === 'error' || state === 'success') {
-      setTimeout(() => applyState(btn, 'idle'), 2500);
+      setTimeout(() => applyState(btn, 'idle'), 3000);
     }
   }
 
   // ─────────────────────────────────────────────────────────────
-  // Handler do clique
+  // Handler principal
   // ─────────────────────────────────────────────────────────────
 
   async function handleClick(btn) {
@@ -246,29 +246,41 @@
       const videoId = getVideoId();
       if (!videoId) throw new Error('ID do vídeo não encontrado');
 
-      const playerResponse = await fetchPlayerResponse(videoId);
-      const tracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+      // 1. Obtém API key da página
+      const apiKey = await fetchInnertubeKey(videoId);
 
-      if (!tracks.length) throw new Error('Nenhuma legenda disponível neste vídeo');
+      // 2. Busca faixas via Innertube (URLs frescas, sem PoToken)
+      const tracks = await fetchCaptionTracksViaInnertube(videoId, apiKey);
 
-      const result = pickBestTrack(tracks);
-      if (!result) throw new Error('Nenhuma faixa de legenda selecionável');
+      // Log diagnóstico (visível no console da extensão)
+      console.log('[YT→Perplexity] Faixas disponíveis:', tracks.map(t =>
+        `${t.languageCode} kind=${t.kind ?? 'manual'} vssId=${t.vssId}`
+      ));
 
-      const { track, tlang } = result;
+      // 3. Seleciona melhor faixa
+      const { track, tlang } = pickBestTrack(tracks);
       const isAsr = track.kind === 'asr' || track.vssId?.startsWith('.a.');
 
-      const transcript = await fetchTranscript(track, tlang);
-      const title      = getVideoTitle();
-      const videoUrl   = `https://www.youtube.com/watch?v=${videoId}`;
-      const prompt     = buildPrompt(title, transcript, videoUrl, isAsr);
+      console.log('[YT→Perplexity] Faixa selecionada:', track.languageCode, 'ASR:', isAsr);
 
-      const perplexityUrl = `https://www.perplexity.ai/?q=${encodeURIComponent(prompt)}`;
-      window.open(perplexityUrl, '_blank', 'noopener,noreferrer');
+      // 4. Baixa transcrição
+      const transcript = await fetchTranscript(track, tlang);
+
+      // 5. Abre Perplexity
+      const title    = getVideoTitle();
+      const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+      const prompt   = buildPrompt(title, transcript, videoUrl, isAsr);
+
+      window.open(
+        `https://www.perplexity.ai/?q=${encodeURIComponent(prompt)}`,
+        '_blank',
+        'noopener,noreferrer'
+      );
 
       applyState(btn, 'success');
     } catch (err) {
-      console.error('[YT→Perplexity]', err.message);
-      applyState(btn, 'error');
+      console.error('[YT→Perplexity]', err.message, err);
+      applyState(btn, 'error', err.message.length < 50 ? `⚠ ${err.message}` : undefined);
     }
   }
 
@@ -315,26 +327,15 @@
     document.getElementById(BUTTON_ID)?.remove();
   }
 
-  window.addEventListener('yt-navigate-start', removeButton);
+  window.addEventListener('yt-navigate-start',    removeButton);
+  window.addEventListener('yt-page-data-updated', () => setTimeout(injectButton, 300));
+  window.addEventListener('yt-navigate-finish',   () => setTimeout(injectButton, 1200));
 
-  window.addEventListener('yt-page-data-updated', () => {
-    setTimeout(injectButton, 300);
-  });
-
-  window.addEventListener('yt-navigate-finish', () => {
-    setTimeout(injectButton, 1200);
-  });
-
-  const observer = new MutationObserver(() => {
+  new MutationObserver(() => {
     if (window.location.pathname.startsWith('/watch') && !document.getElementById(BUTTON_ID)) {
       injectButton();
     }
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
-
-  // ─────────────────────────────────────────────────────────────
-  // Init
-  // ─────────────────────────────────────────────────────────────
+  }).observe(document.body, { childList: true, subtree: true });
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', injectButton);
