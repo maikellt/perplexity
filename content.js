@@ -136,13 +136,10 @@ async function openInPerplexity() {
   });
 }
 // content.js — Parte 3: Injeção do botão no player do YouTube
+// content.js — Parte 3 (corrigida)
 
 const BUTTON_ID = "yt-perplexity-btn";
 
-/**
- * Cria e estiliza o botão injetado na barra de controles do player.
- * @returns {HTMLButtonElement}
- */
 function createButton() {
   const btn = document.createElement("button");
   btn.id = BUTTON_ID;
@@ -175,12 +172,10 @@ function createButton() {
 
   btn.addEventListener("mouseenter", () => (btn.style.opacity = "1"));
   btn.addEventListener("mouseleave", () => (btn.style.opacity = "0.9"));
-
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
     btn.style.opacity = "0.4";
     btn.disabled = true;
-
     openInPerplexity().finally(() => {
       btn.style.opacity = "0.9";
       btn.disabled = false;
@@ -190,52 +185,67 @@ function createButton() {
   return btn;
 }
 
-/**
- * Injeta o botão na barra direita de controles do player.
- */
 function injectButton() {
   if (document.getElementById(BUTTON_ID)) return;
 
-  const targetSelectors = [
+  const selectors = [
     ".ytp-right-controls",
     ".ytp-chrome-controls .ytp-right-controls",
   ];
 
-  for (const sel of targetSelectors) {
-    const controls = document.querySelector(sel);
-    if (controls) {
-      controls.prepend(createButton());
-      return;
+  for (const sel of selectors) {
+    const el = document.querySelector(sel);
+    if (el) {
+      el.prepend(createButton());
+      return true; // injetado com sucesso
     }
   }
+  return false; // player ainda não está no DOM
 }
 
 /**
- * Observa mutações no DOM para reinjetar o botão ao navegar entre vídeos (SPA).
+ * Tenta injetar com retries em intervalos crescentes (backoff linear).
+ * Para assim que conseguir ou após esgotar as tentativas.
+ */
+function injectWithRetry(maxAttempts = 10, intervalMs = 500) {
+  let attempts = 0;
+
+  const timer = setInterval(() => {
+    attempts++;
+    const success = injectButton();
+
+    if (success || attempts >= maxAttempts) {
+      clearInterval(timer);
+    }
+  }, intervalMs);
+}
+
+/**
+ * Escuta o evento nativo do YouTube para navegação entre vídeos (SPA).
+ * Mais confiável que MutationObserver para esse caso específico.
  */
 function observeNavigation() {
-  let debounceTimer = null;
-
-  const observer = new MutationObserver(() => {
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      if (!document.getElementById(BUTTON_ID)) {
-        subtitlesUrl = null; // reseta ao trocar de vídeo
-        injectButton();
-      }
-    }, 600);
+  // Evento disparado pelo próprio YouTube ao concluir navegação SPA
+  window.addEventListener("yt-navigate-finish", () => {
+    subtitlesUrl = null;
+    injectWithRetry();
   });
 
-  observer.observe(document.body, { childList: true, subtree: true });
+  // Fallback: MutationObserver observando apenas o container do player,
+  // não o body inteiro — muito mais eficiente
+  const observer = new MutationObserver(() => {
+    if (!document.getElementById(BUTTON_ID)) {
+      injectButton();
+    }
+  });
+
+  // Observa apenas a região do player, não o DOM inteiro
+  const playerContainer = document.querySelector("#movie_player, #player");
+  if (playerContainer) {
+    observer.observe(playerContainer, { childList: true, subtree: true });
+  }
 }
 
 // --- Inicialização ---
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", () => {
-    injectButton();
-    observeNavigation();
-  });
-} else {
-  injectButton();
-  observeNavigation();
-}
+injectWithRetry();
+observeNavigation();
