@@ -1,346 +1,241 @@
-// content.js — YouTube → Perplexity Summarizer (v1.3)
-// Estratégia: usa Innertube API (POST) para obter captionTracks frescos,
-// evitando baseUrl com &exp=xpe (PoToken) que causa resposta vazia.
+// content.js — Parte 1: Interceptação da URL e extração da transcrição
 
-(function () {
-  'use strict';
+let subtitlesUrl = null;
 
-  const BUTTON_ID   = 'yt-perplexity-btn';
-  const MAX_CHARS   = 8000;
-  const LANG_PRIORITY = ['pt-BR', 'pt', 'pt-PT', 'en', 'en-US', 'en-GB'];
+/**
+ * Recebe a URL interceptada pelo background service worker.
+ */
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === "SUBTITLES_URL_INTERCEPTED") {
+    subtitlesUrl = message.url;
+  }
+});
 
-  // Contexto padrão do cliente web do YouTube (Innertube)
-  const INNERTUBE_CONTEXT = {
-    client: {
-      clientName: 'WEB',
-      clientVersion: '2.20240101.00.00',
-      hl: 'pt-BR',
-      gl: 'BR',
-    },
-  };
-
-  // ─────────────────────────────────────────────────────────────
-  // Utilitários
-  // ─────────────────────────────────────────────────────────────
-
-  function getVideoId() {
-    return new URLSearchParams(window.location.search).get('v');
+/**
+ * Busca e faz o parse da transcrição a partir da URL capturada.
+ * @returns {Promise<string>}
+ */
+async function fetchTranscript() {
+  if (!subtitlesUrl) {
+    throw new Error("URL da transcrição ainda não foi capturada. Reproduza o vídeo primeiro.");
   }
 
-  function getVideoTitle() {
-    const selectors = [
-      'h1.ytd-watch-metadata yt-formatted-string',
-      'h1.style-scope.ytd-watch-metadata',
-      '#title h1',
-    ];
-    for (const s of selectors) {
-      const el = document.querySelector(s);
-      if (el?.textContent?.trim()) return el.textContent.trim();
-    }
-    return document.title.replace(' - YouTube', '').trim();
+  const response = await fetch(subtitlesUrl);
+  if (!response.ok) {
+    throw new Error(`Falha ao buscar transcrição: HTTP ${response.status}`);
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // Extrai INNERTUBE_API_KEY do HTML da página
-  // ─────────────────────────────────────────────────────────────
+  const xml = await response.text();
+  return parseTranscriptXml(xml);
+}
 
-  async function fetchInnertubeKey(videoId) {
-    const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-      credentials: 'include',
-      headers: { 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' },
-    });
-    if (!res.ok) throw new Error(`Falha na página: HTTP ${res.status}`);
-    const html = await res.text();
+/**
+ * Faz o parse do XML da API timedtext do YouTube.
+ * @param {string} xmlString
+ * @returns {string}
+ */
+function parseTranscriptXml(xmlString) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xmlString, "text/xml");
+  const nodes = doc.querySelectorAll("text");
 
-    const m = html.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/);
-    if (!m) throw new Error('INNERTUBE_API_KEY não encontrada na página');
-    return m[1];
+  if (nodes.length === 0) {
+    throw new Error("Nenhuma legenda encontrada no XML retornado.");
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // Chama a Innertube API para obter captionTracks frescos
-  // (sem &exp=xpe, sem expiração problemática)
-  // ─────────────────────────────────────────────────────────────
-
-  async function fetchCaptionTracksViaInnertube(videoId, apiKey) {
-    const url = `https://www.youtube.com/youtubei/v1/player?key=${apiKey}&prettyPrint=false`;
-    const res = await fetch(url, {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
-      },
-      body: JSON.stringify({
-        context: INNERTUBE_CONTEXT,
-        videoId,
-      }),
-    });
-
-    if (!res.ok) throw new Error(`Innertube API: HTTP ${res.status}`);
-    const data = await res.json();
-
-    const tracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-    if (!tracks?.length) throw new Error('Nenhuma legenda disponível neste vídeo');
-
-    return tracks;
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // Seleção da melhor faixa
-  // ─────────────────────────────────────────────────────────────
-
-  function pickBestTrack(tracks) {
-    // 1. Manual no idioma preferido
-    for (const lang of LANG_PRIORITY) {
-      const t = tracks.find(t => t.vssId === '.' + lang);
-      if (t) return { track: t, tlang: null };
-    }
-    // 2. ASR no idioma preferido
-    for (const lang of LANG_PRIORITY) {
-      const code = lang.split('-')[0];
-      const t = tracks.find(
-        t => (t.kind === 'asr' || t.vssId?.startsWith('.a.')) &&
-             (t.languageCode === lang || t.languageCode === code)
-      );
-      if (t) return { track: t, tlang: null };
-    }
-    // 3. Qualquer manual + tradução automática para pt-BR
-    const manual = tracks.find(t => t.kind !== 'asr' && !t.vssId?.startsWith('.a.'));
-    if (manual) return { track: manual, tlang: 'pt-BR' };
-
-    // 4. Qualquer faixa disponível
-    return { track: tracks[0], tlang: 'pt-BR' };
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // Busca da transcrição — XML (mais confiável que JSON3 para ASR)
-  // ─────────────────────────────────────────────────────────────
-
-  function buildTranscriptUrl(track, tlang) {
-    // Remove fmt existente e parâmetros problemáticos
-    let url = track.baseUrl
-      .replace(/[&?]fmt=[^&]*/g, '')
-      .replace(/[&?]exp=xpe[^&]*/g, '');
-
-    // Garante o separador correto
-    url += (url.includes('?') ? '&' : '?') + 'hl=pt-BR';
-    if (tlang) url += `&tlang=${tlang}`;
-
-    return url;
-  }
-
-  function parseXML(xmlText) {
-    const matches = [...xmlText.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)];
-    if (!matches.length) throw new Error('Nenhum segmento no XML da transcrição');
-
-    return matches
-      .map(m => m[1]
-        .replace(/<[^>]+>/g, '')
-        .replace(/&amp;/g,  '&')
-        .replace(/&lt;/g,   '<')
-        .replace(/&gt;/g,   '>')
-        .replace(/&#39;/g,  "'")
+  return Array.from(nodes)
+    .map((node) =>
+      node.textContent
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
         .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/\n/g, " ")
         .trim()
-      )
-      .filter(Boolean)
-      .join(' ')
-      .replace(/\s{2,}/g, ' ')
-      .trim();
-  }
+    )
+    .filter((line) => line.length > 0)
+    .join(" ");
+}
 
-  async function fetchTranscript(track, tlang) {
-    const url = buildTranscriptUrl(track, tlang);
+// content.js — Parte 2: Título, prompt e envio ao background
 
-    const res = await fetch(url, { credentials: 'include' });
-    if (!res.ok) throw new Error(`Transcrição: HTTP ${res.status}`);
-
-    const text = await res.text();
-    if (!text?.trim()) throw new Error('Resposta da transcrição vazia');
-
-    // Tenta XML (padrão e mais confiável)
-    if (text.trim().startsWith('<')) {
-      const result = parseXML(text);
-      if (result) return result;
-      throw new Error('XML sem segmentos válidos');
-    }
-
-    // Tenta JSON3 como fallback
-    if (text.trim().startsWith('{')) {
-      const data = JSON.parse(text);
-      const result = (data.events ?? [])
-        .filter(e => Array.isArray(e.segs))
-        .map(e => e.segs.map(s => s.utf8 ?? '').join(''))
-        .join(' ')
-        .replace(/\s{2,}/g, ' ')
-        .trim();
-      if (result) return result;
-      throw new Error('JSON3 sem texto válido');
-    }
-
-    throw new Error('Formato de transcrição não reconhecido');
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // Construção do prompt
-  // ─────────────────────────────────────────────────────────────
-
-  function buildPrompt(title, transcript, videoUrl, isAsr) {
-    let body = transcript;
-    let truncated = false;
-    if (body.length > MAX_CHARS) {
-      body = body.slice(0, MAX_CHARS);
-      truncated = true;
-    }
-
-    const notes = [];
-    if (isAsr) notes.push('transcrição gerada automaticamente — pode conter imprecisões');
-    if (truncated) notes.push('transcrição truncada por limite de caracteres');
-
-    return [
-      'Resuma o vídeo do YouTube abaixo com base na transcrição fornecida.',
-      '',
-      `Título: ${title}`,
-      `URL: ${videoUrl}`,
-      ...(notes.length ? [`Notas: ${notes.join('; ')}`] : []),
-      '',
-      'Instruções:',
-      '- Apresente os principais pontos em tópicos',
-      '- Seja objetivo e claro',
-      '- Responda em português do Brasil',
-      '',
-      'Transcrição:',
-      body,
-    ].join('\n');
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // Estados do botão
-  // ─────────────────────────────────────────────────────────────
-
-  function applyState(btn, state, errorMsg) {
-    const labels = {
-      idle:    '▶ Resumir no Perplexity',
-      loading: '⏳ Obtendo transcrição...',
-      error:   errorMsg || '⚠ Sem transcrição disponível',
-      success: '✓ Aberto no Perplexity',
-    };
-    btn.querySelector('.yt-pp-label').textContent = labels[state];
-    btn.disabled = state !== 'idle';
-    btn.dataset.state = state;
-    if (state === 'error' || state === 'success') {
-      setTimeout(() => applyState(btn, 'idle'), 3000);
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // Handler principal
-  // ─────────────────────────────────────────────────────────────
-
-  async function handleClick(btn) {
-    if (btn.disabled) return;
-    applyState(btn, 'loading');
-
-    try {
-      const videoId = getVideoId();
-      if (!videoId) throw new Error('ID do vídeo não encontrado');
-
-      // 1. Obtém API key da página
-      const apiKey = await fetchInnertubeKey(videoId);
-
-      // 2. Busca faixas via Innertube (URLs frescas, sem PoToken)
-      const tracks = await fetchCaptionTracksViaInnertube(videoId, apiKey);
-
-      // Log diagnóstico (visível no console da extensão)
-      console.log('[YT→Perplexity] Faixas disponíveis:', tracks.map(t =>
-        `${t.languageCode} kind=${t.kind ?? 'manual'} vssId=${t.vssId}`
-      ));
-
-      // 3. Seleciona melhor faixa
-      const { track, tlang } = pickBestTrack(tracks);
-      const isAsr = track.kind === 'asr' || track.vssId?.startsWith('.a.');
-
-      console.log('[YT→Perplexity] Faixa selecionada:', track.languageCode, 'ASR:', isAsr);
-
-      // 4. Baixa transcrição
-      const transcript = await fetchTranscript(track, tlang);
-
-      // 5. Abre Perplexity
-      const title    = getVideoTitle();
-      const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-      const prompt   = buildPrompt(title, transcript, videoUrl, isAsr);
-
-      window.open(
-        `https://www.perplexity.ai/?q=${encodeURIComponent(prompt)}`,
-        '_blank',
-        'noopener,noreferrer'
-      );
-
-      applyState(btn, 'success');
-    } catch (err) {
-      console.error('[YT→Perplexity]', err.message, err);
-      applyState(btn, 'error', err.message.length < 50 ? `⚠ ${err.message}` : undefined);
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  // Injeção do botão
-  // ─────────────────────────────────────────────────────────────
-
-  const ACTION_BAR_SELECTORS = [
-    'ytd-watch-metadata #actions',
-    '#top-level-buttons-computed',
-    'ytd-watch-flexy #actions',
+/**
+ * Extrai o título do vídeo diretamente do DOM do YouTube.
+ * Tenta seletores em ordem de prioridade (o DOM do YT muda com frequência).
+ * @returns {string}
+ */
+function getVideoTitle() {
+  const selectors = [
+    "h1.ytd-watch-metadata yt-formatted-string",
+    "h1.title.ytd-video-primary-info-renderer",
+    "#title h1",
+    "h1.ytd-video-primary-info-renderer",
   ];
 
-  function findActionBar() {
-    for (const s of ACTION_BAR_SELECTORS) {
-      const el = document.querySelector(s);
-      if (el) return el;
+  for (const sel of selectors) {
+    const el = document.querySelector(sel);
+    if (el?.textContent?.trim()) {
+      return el.textContent.trim();
     }
-    return null;
   }
 
-  function injectButton() {
-    if (!window.location.pathname.startsWith('/watch')) return;
-    if (document.getElementById(BUTTON_ID)) return;
+  // Fallback: título da aba, removendo sufixo " - YouTube"
+  return document.title.replace(/ - YouTube$/, "").trim() || "Vídeo sem título";
+}
 
-    const actionBar = findActionBar();
-    if (!actionBar) return;
+/**
+ * Monta o prompt enviado ao Perplexity.
+ * Limita a transcrição a ~8.000 chars para não ultrapassar o limite de URL.
+ * @param {string} title
+ * @param {string} transcript
+ * @returns {string}
+ */
+function buildPrompt(title, transcript) {
+  const MAX_TRANSCRIPT_CHARS = 8000;
 
-    const btn = document.createElement('button');
-    btn.id = BUTTON_ID;
-    btn.dataset.state = 'idle';
-    btn.setAttribute('aria-label', 'Resumir este vídeo no Perplexity');
-    btn.innerHTML = `<span class="yt-pp-label">▶ Resumir no Perplexity</span>`;
-    btn.addEventListener('click', () => handleClick(btn));
+  const truncated =
+    transcript.length > MAX_TRANSCRIPT_CHARS
+      ? transcript.slice(0, MAX_TRANSCRIPT_CHARS) + "... [transcrição truncada]"
+      : transcript;
 
-    actionBar.parentElement.insertBefore(btn, actionBar.nextSibling);
+  return (
+    `Assista ao vídeo do YouTube intitulado "${title}" e responda com base na transcrição abaixo.\n\n` +
+    `TRANSCRIÇÃO:\n${truncated}\n\n` +
+    `Por favor, faça um resumo detalhado dos principais pontos abordados no vídeo.`
+  );
+}
+
+/**
+ * Orquestra o fluxo completo:
+ * 1. Busca a transcrição  2. Extrai o título
+ * 3. Monta o prompt       4. Envia ao background
+ * @returns {Promise<void>}
+ */
+async function openInPerplexity() {
+  const title = getVideoTitle();
+  let transcript;
+
+  try {
+    transcript = await fetchTranscript();
+  } catch (err) {
+    alert(`Não foi possível obter a transcrição:\n\n${err.message}`);
+    return;
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // Observadores de navegação SPA
-  // ─────────────────────────────────────────────────────────────
+  const prompt = buildPrompt(title, transcript);
 
-  function removeButton() {
-    document.getElementById(BUTTON_ID)?.remove();
-  }
-
-  window.addEventListener('yt-navigate-start',    removeButton);
-  window.addEventListener('yt-page-data-updated', () => setTimeout(injectButton, 300));
-  window.addEventListener('yt-navigate-finish',   () => setTimeout(injectButton, 1200));
-
-  new MutationObserver(() => {
-    if (window.location.pathname.startsWith('/watch') && !document.getElementById(BUTTON_ID)) {
-      injectButton();
+  chrome.runtime.sendMessage({ type: "OPEN_PERPLEXITY", prompt }, (response) => {
+    if (chrome.runtime.lastError) {
+      console.error("[YT→Perplexity] Erro ao comunicar com background:", chrome.runtime.lastError.message);
+      return;
     }
-  }).observe(document.body, { childList: true, subtree: true });
+    if (!response?.success) {
+      console.error("[YT→Perplexity] Background reportou falha:", response?.error);
+    }
+  });
+}
+// content.js — Parte 3: Injeção do botão no player do YouTube
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', injectButton);
-  } else {
+const BUTTON_ID = "yt-perplexity-btn";
+
+/**
+ * Cria e estiliza o botão injetado na barra de controles do player.
+ * @returns {HTMLButtonElement}
+ */
+function createButton() {
+  const btn = document.createElement("button");
+  btn.id = BUTTON_ID;
+  btn.title = "Resumir no Perplexity";
+  btn.setAttribute("aria-label", "Resumir vídeo no Perplexity");
+
+  btn.innerHTML = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24"
+         fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="11" cy="11" r="8"/>
+      <path d="m21 21-4.35-4.35"/>
+      <path d="M11 8v6M8 11h6"/>
+    </svg>
+  `;
+
+  Object.assign(btn.style, {
+    background: "transparent",
+    border: "none",
+    color: "#fff",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: "0 6px",
+    height: "100%",
+    opacity: "0.9",
+    transition: "opacity 0.15s ease",
+  });
+
+  btn.addEventListener("mouseenter", () => (btn.style.opacity = "1"));
+  btn.addEventListener("mouseleave", () => (btn.style.opacity = "0.9"));
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    btn.style.opacity = "0.4";
+    btn.disabled = true;
+
+    openInPerplexity().finally(() => {
+      btn.style.opacity = "0.9";
+      btn.disabled = false;
+    });
+  });
+
+  return btn;
+}
+
+/**
+ * Injeta o botão na barra direita de controles do player.
+ */
+function injectButton() {
+  if (document.getElementById(BUTTON_ID)) return;
+
+  const targetSelectors = [
+    ".ytp-right-controls",
+    ".ytp-chrome-controls .ytp-right-controls",
+  ];
+
+  for (const sel of targetSelectors) {
+    const controls = document.querySelector(sel);
+    if (controls) {
+      controls.prepend(createButton());
+      return;
+    }
+  }
+}
+
+/**
+ * Observa mutações no DOM para reinjetar o botão ao navegar entre vídeos (SPA).
+ */
+function observeNavigation() {
+  let debounceTimer = null;
+
+  const observer = new MutationObserver(() => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      if (!document.getElementById(BUTTON_ID)) {
+        subtitlesUrl = null; // reseta ao trocar de vídeo
+        injectButton();
+      }
+    }, 600);
+  });
+
+  observer.observe(document.body, { childList: true, subtree: true });
+}
+
+// --- Inicialização ---
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", () => {
     injectButton();
-  }
-
-})();
+    observeNavigation();
+  });
+} else {
+  injectButton();
+  observeNavigation();
+}
